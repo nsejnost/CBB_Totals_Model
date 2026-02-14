@@ -6,3 +6,11 @@ xgboost>=2.0.0
 lightgbm>=4.0.0
 requests>=2.31.0
 plotly>=5.18.0
+lightgbm
+numpy
+pandas
+plotly
+requests
+scikit-learn
+streamlit
+xgboost
