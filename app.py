@@ -21,13 +21,14 @@ import plotly.graph_objects as go
 
 from data_loader import (
     load_vegas_data, load_all_torvik, build_name_map,
-    build_rolling_stats, merge_datasets,
+    build_rolling_stats, merge_datasets, build_upcoming_rows,
 )
 from features import build_feature_matrix
 from model import (
     DEFAULT_PARAMS, TotalsModel, walk_forward_backtest,
-    compute_backtest_metrics,
+    compute_backtest_metrics, train_full_model, predict_upcoming,
 )
+from odds_api import fetch_upcoming_odds, pick_consensus_line
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -143,8 +144,9 @@ st.caption(
 )
 
 # Tabs
-tab_overview, tab_backtest, tab_explore, tab_features, tab_methodology = st.tabs([
+tab_overview, tab_value, tab_backtest, tab_explore, tab_features, tab_methodology = st.tabs([
     "Overview & Predictions",
+    "Today's Value Bets",
     "Backtest Results",
     "Game Explorer",
     "Feature Importance",
@@ -221,6 +223,18 @@ with st.spinner("Loading data pipeline…"):
 # ── Run backtest ─────────────────────────────────────────────────────────────
 
 run_backtest = st.sidebar.button("Run Backtest", type="primary", use_container_width=True)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Live Odds (The Odds API)")
+odds_api_key = st.sidebar.text_input(
+    "Odds API Key",
+    type="password",
+    help="Enter your API key from https://the-odds-api.com to fetch live odds.",
+)
+min_edge_filter = st.sidebar.slider(
+    "Min edge to display (pts)", 0.0, 5.0, 1.0, 0.5,
+    help="Only show games where model edge exceeds this threshold.",
+)
 
 if "backtest_results" not in st.session_state:
     st.session_state.backtest_results = None
@@ -314,6 +328,186 @@ with tab_overview:
 | **Static ratings** | Updated daily but still season-long | Walk-forward retraining captures regime changes |
 | **No opponent-quality adjustment on trends** | Season-wide SOS | Rolling opponent quality EMA tracks recent schedule difficulty |
         """)
+
+
+# ── Tab: Today's Value Bets ─────────────────────────────────────────────────
+
+with tab_value:
+    st.header("Today's Value Bets")
+
+    if not odds_api_key:
+        st.info(
+            "Enter your **Odds API key** in the sidebar to fetch live odds "
+            "for upcoming games. Get a free key at https://the-odds-api.com"
+        )
+    else:
+        fetch_odds_btn = st.button("Fetch Live Odds & Run Model", type="primary")
+
+        if fetch_odds_btn:
+            # 1. Fetch odds
+            with st.spinner("Fetching upcoming odds from The Odds API..."):
+                try:
+                    raw_odds, api_info = fetch_upcoming_odds(odds_api_key)
+                except Exception as e:
+                    st.error(f"Failed to fetch odds: {e}")
+                    raw_odds = pd.DataFrame()
+                    api_info = {}
+
+            if raw_odds.empty:
+                st.warning("No upcoming games with totals found from the API.")
+            else:
+                st.caption(
+                    f"API requests remaining: {api_info.get('requests_remaining', '?')} | "
+                    f"Used: {api_info.get('requests_used', '?')}"
+                )
+
+                # 2. Pick consensus line across bookmakers
+                consensus = pick_consensus_line(raw_odds)
+                st.caption(f"Found {len(consensus)} upcoming games with odds.")
+
+                # 3. Build upcoming game features
+                with st.spinner("Building features for upcoming games..."):
+                    rolling_df = _build_rolling(torvik_hash)
+                    name_map_all = _build_name_map(vegas_hash, torvik_hash)
+
+                    # Extend the name map with upcoming game team names
+                    new_vegas_names = list(set(
+                        consensus["home_team"].tolist()
+                        + consensus["away_team"].tolist()
+                    ))
+                    torvik_names_all = list(set(
+                        torvik_df["team1"].dropna().unique().tolist()
+                        + torvik_df["team2"].dropna().unique().tolist()
+                    ))
+                    live_name_map = build_name_map(new_vegas_names, torvik_names_all)
+                    # Merge: prefer existing map, fill in from live map
+                    full_name_map = {**live_name_map, **name_map_all}
+
+                    upcoming_rows = build_upcoming_rows(
+                        consensus, rolling_df, full_name_map,
+                    )
+
+                if upcoming_rows.empty:
+                    st.warning(
+                        "Could not match any upcoming game teams to Torvik data. "
+                        "Team name mapping may need updating."
+                    )
+                else:
+                    # 4. Build feature matrix
+                    with st.spinner("Engineering features..."):
+                        upcoming_feat, uf_cols = build_feature_matrix(upcoming_rows)
+
+                    # 5. Train model on full historical data and predict
+                    with st.spinner("Training model on full history & predicting..."):
+                        try:
+                            model = train_full_model(
+                                feature_df, feat_cols, user_params,
+                            )
+                            results = predict_upcoming(model, upcoming_feat)
+                        except Exception as e:
+                            st.error(f"Model error: {e}")
+                            results = pd.DataFrame()
+
+                    if not results.empty:
+                        # Store in session state for persistence
+                        st.session_state["value_bets"] = results
+
+        # Display results (persisted across reruns)
+        if "value_bets" in st.session_state and not st.session_state["value_bets"].empty:
+            results = st.session_state["value_bets"]
+
+            # Filter by minimum edge
+            display = results[results["abs_edge"] >= min_edge_filter].copy()
+            display = display.sort_values("abs_edge", ascending=False)
+
+            if display.empty:
+                st.info(
+                    f"No games found with edge >= {min_edge_filter} pts. "
+                    "Try lowering the minimum edge filter in the sidebar."
+                )
+            else:
+                # Summary metrics
+                n_value = len(display)
+                avg_edge = display["abs_edge"].mean()
+                n_over = (display["bet_side"] == "OVER").sum()
+                n_under = (display["bet_side"] == "UNDER").sum()
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Value Bets Found", n_value)
+                c2.metric("Avg Edge", f"{avg_edge:.1f} pts")
+                c3.metric("Overs", n_over)
+                c4.metric("Unders", n_under)
+
+                st.markdown("---")
+
+                # Detailed table
+                table_cols = {
+                    "commence_time": "Game Time",
+                    "home_team": "Home",
+                    "away_team": "Away",
+                    "vegas_total": "Vegas Total",
+                    "model_total": "Model Total",
+                    "model_edge": "Edge",
+                    "bet_side": "Side",
+                    "over_price": "Over Price",
+                    "under_price": "Under Price",
+                }
+                avail = [c for c in table_cols if c in display.columns]
+                show = display[avail].rename(columns=table_cols)
+
+                # Format game time
+                if "Game Time" in show.columns:
+                    show["Game Time"] = pd.to_datetime(
+                        show["Game Time"]
+                    ).dt.strftime("%b %d  %I:%M %p")
+
+                fmt = {}
+                if "Vegas Total" in show.columns:
+                    fmt["Vegas Total"] = "{:.1f}"
+                if "Model Total" in show.columns:
+                    fmt["Model Total"] = "{:.1f}"
+                if "Edge" in show.columns:
+                    fmt["Edge"] = "{:+.1f}"
+                if "Over Price" in show.columns:
+                    fmt["Over Price"] = "{:+.0f}"
+                if "Under Price" in show.columns:
+                    fmt["Under Price"] = "{:+.0f}"
+
+                st.dataframe(
+                    show.style.format(fmt),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(600, 50 + 35 * len(show)),
+                )
+
+                # Individual game cards for top edges
+                st.subheader("Top Value Plays")
+                for _, row in display.head(5).iterrows():
+                    edge = row["model_edge"]
+                    side = row["bet_side"]
+                    price_col = "over_price" if side == "OVER" else "under_price"
+                    price = row.get(price_col, None)
+                    price_str = f" ({price:+.0f})" if pd.notna(price) else ""
+
+                    with st.container(border=True):
+                        gc1, gc2, gc3 = st.columns([3, 2, 2])
+                        gc1.markdown(
+                            f"**{row['away_team']}** @ **{row['home_team']}**"
+                        )
+                        gc2.metric(
+                            "Model Total",
+                            f"{row['model_total']:.1f}",
+                            delta=f"{edge:+.1f} vs Vegas {row['vegas_total']:.1f}",
+                        )
+                        gc3.markdown(
+                            f"### {side}{price_str}"
+                        )
+
+                st.caption(
+                    "Edge = Model Total - Vegas Total. "
+                    "Positive edge = model expects higher scoring (lean OVER). "
+                    "Negative edge = model expects lower scoring (lean UNDER)."
+                )
 
 
 # ── Tab: Backtest Results ────────────────────────────────────────────────────

@@ -426,6 +426,95 @@ def build_rolling_stats(
     return tg
 
 
+def get_latest_team_stats(rolling: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return the most recent rolling-stat row for every team.
+
+    This gives us each team's latest EMA/rolling/season features — exactly
+    what we need to build features for upcoming (un-played) games.
+    """
+    rolling = rolling.sort_values(["team", "date"])
+    latest = rolling.groupby("team").tail(1).copy()
+    latest = latest.set_index("team")
+    return latest
+
+
+def build_upcoming_rows(
+    upcoming: pd.DataFrame,
+    rolling: pd.DataFrame,
+    name_map: dict,
+) -> pd.DataFrame:
+    """
+    Build a model-ready DataFrame for upcoming games (no actual results).
+
+    Parameters
+    ----------
+    upcoming : DataFrame with columns:
+        home_team, away_team, total_point, spread_home_point
+        (from odds_api.pick_consensus_line)
+    rolling : DataFrame from build_rolling_stats
+    name_map : dict mapping Odds API team names → Torvik team names
+
+    Returns
+    -------
+    DataFrame with home/away rolling features, vegas_total, spread columns
+    — ready for build_feature_matrix().
+    """
+    latest = get_latest_team_stats(rolling)
+
+    rows = []
+    for _, game in upcoming.iterrows():
+        home_vegas = game["home_team"]
+        away_vegas = game["away_team"]
+
+        home_torvik = name_map.get(home_vegas)
+        away_torvik = name_map.get(away_vegas)
+
+        if home_torvik is None or away_torvik is None:
+            continue
+        if home_torvik not in latest.index or away_torvik not in latest.index:
+            continue
+
+        h_stats = latest.loc[home_torvik]
+        a_stats = latest.loc[away_torvik]
+
+        row = {}
+        # Carry over game-level fields
+        for col in ["game_id", "commence_time", "over_price", "under_price",
+                     "n_books"]:
+            if col in game.index:
+                row[col] = game[col]
+
+        row["home_team"] = home_vegas
+        row["away_team"] = away_vegas
+        row["home_torvik"] = home_torvik
+        row["away_torvik"] = away_torvik
+        row["closing_total_point"] = game["total_point"]
+        row["vegas_total"] = game["total_point"]
+        row["closing_spread_home_point"] = game.get("spread_home_point", 0) or 0
+
+        # Use commence_time as the game_date for feature engineering
+        ct = pd.to_datetime(game.get("commence_time"))
+        row["game_date"] = ct if pd.notna(ct) else pd.Timestamp.now()
+
+        # Attach home rolling stats with h_ prefix
+        for col in h_stats.index:
+            row[f"h_{col}"] = h_stats[col]
+        # Attach away rolling stats with a_ prefix
+        for col in a_stats.index:
+            row[f"a_{col}"] = a_stats[col]
+
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # Ensure game_date is datetime
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Merge Vegas + Torvik → feature matrix
 # ---------------------------------------------------------------------------
