@@ -241,6 +241,7 @@ def walk_forward_backtest(
     df: pd.DataFrame,
     feat_cols: list[str],
     params: dict | None = None,
+    progress_callback=None,
 ) -> pd.DataFrame:
     """
     Time-ordered walk-forward backtest.
@@ -263,7 +264,12 @@ def walk_forward_backtest(
     model = None
     last_train_idx = -1
 
+    total_steps = n - min_train
     for i in range(min_train, n):
+        # Report progress
+        if progress_callback is not None and total_steps > 0:
+            progress_callback((i - min_train) / total_steps)
+
         # Retrain periodically
         if model is None or (i - last_train_idx) >= retrain_every:
             with warnings.catch_warnings():

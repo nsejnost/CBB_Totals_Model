@@ -13,6 +13,8 @@ on KenPom-style approaches via:
 Run:  streamlit run app.py
 """
 
+import os
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -225,12 +227,7 @@ with st.spinner("Loading data pipeline…"):
 run_backtest = st.sidebar.button("Run Backtest", type="primary", use_container_width=True)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Live Odds (The Odds API)")
-odds_api_key = st.sidebar.text_input(
-    "Odds API Key",
-    type="password",
-    help="Enter your API key from https://the-odds-api.com to fetch live odds.",
-)
+odds_api_key = os.environ.get("ODDS_API_KEY", "")
 min_edge_filter = st.sidebar.slider(
     "Min edge to display (pts)", 0.0, 5.0, 1.0, 0.5,
     help="Only show games where model edge exceeds this threshold.",
@@ -242,12 +239,19 @@ if "backtest_results" not in st.session_state:
     st.session_state.backtest_metrics = None
 
 if run_backtest:
-    with st.spinner("Running walk-forward backtest… this may take a minute."):
-        bt = walk_forward_backtest(feature_df, feat_cols, user_params)
-        metrics = compute_backtest_metrics(bt)
-        st.session_state.backtest_results = bt
-        st.session_state.backtest_params = user_params.copy()
-        st.session_state.backtest_metrics = metrics
+    progress_bar = st.progress(0, text="Running walk-forward backtest…")
+    bt = walk_forward_backtest(
+        feature_df, feat_cols, user_params,
+        progress_callback=lambda pct: progress_bar.progress(
+            min(pct, 1.0),
+            text=f"Backtesting… {pct:.0%} complete",
+        ),
+    )
+    progress_bar.progress(1.0, text="Backtest complete!")
+    metrics = compute_backtest_metrics(bt)
+    st.session_state.backtest_results = bt
+    st.session_state.backtest_params = user_params.copy()
+    st.session_state.backtest_metrics = metrics
 
 bt = st.session_state.backtest_results
 metrics = st.session_state.backtest_metrics
@@ -337,7 +341,7 @@ with tab_value:
 
     if not odds_api_key:
         st.info(
-            "Enter your **Odds API key** in the sidebar to fetch live odds "
+            "Set the **ODDS_API_KEY** secret in Replit to fetch live odds "
             "for upcoming games. Get a free key at https://the-odds-api.com"
         )
     else:
