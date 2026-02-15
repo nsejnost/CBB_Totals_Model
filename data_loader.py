@@ -10,6 +10,7 @@ import os
 import re
 import pandas as pd
 import numpy as np
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Barttorvik column names (positional – the CSV has no header row)
@@ -196,7 +197,7 @@ def _normalize_school(name: str) -> str:
     'CSU Bakersfield' -> 'cal state bakersfield'
     """
     s = name.strip().lower()
-    s = s.replace("'", "'")  # normalize quotes
+    s = s.replace("\u2019", "'")  # normalize quotes
 
     # Special full-name replacements (before general rules)
     special = {
@@ -228,12 +229,12 @@ def _normalize_school(name: str) -> str:
     # CSU -> Cal State
     s = re.sub(r"^csu\b", "cal state", s)
 
-    # Expand 'St' → 'State' (but not 'St.' which means Saint)
-    # 'Alabama St' → 'Alabama State' but 'St. Francis' stays
+    # Expand 'St' -> 'State' (but not 'St.' which means Saint)
+    # 'Alabama St' -> 'Alabama State' but 'St. Francis' stays
     s = re.sub(r"\bst$", "state", s)  # "St" at end of string
     s = re.sub(r"\bst\b(?!\.)", "state", s)  # "St" not followed by "."
 
-    # 'Univ.' or 'Univ' → 'University'
+    # 'Univ.' or 'Univ' -> 'University'
     s = re.sub(r"\buniv\.?\b", "university", s)
 
     # Standardise punctuation for final comparison
@@ -257,11 +258,13 @@ def build_name_map(
     vegas_names: list[str],
     torvik_names: list[str],
     mapping_path: str | None = None,
-) -> dict:
+) -> tuple[dict, list[str]]:
     """
     Build a mapping from Vegas team names -> Torvik team names.
 
     Uses the curated mapping file as primary source, with fuzzy fallback.
+
+    Returns (name_map, unmatched_names).
     """
     from difflib import get_close_matches
 
@@ -282,6 +285,7 @@ def build_name_map(
     torvik_lower_list = list(norm_to_torvik.keys())
 
     result: dict[str, str] = {}
+    unmatched: list[str] = []
 
     for vn in vegas_names:
         # Step 1: strip mascot
@@ -323,8 +327,10 @@ def build_name_map(
         )
         if matches:
             result[vn] = norm_to_torvik[matches[0]]
+        else:
+            unmatched.append(vn)
 
-    return result
+    return result, unmatched
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +342,7 @@ def _team_game_rows(torvik: pd.DataFrame) -> pd.DataFrame:
 
     Uses vectorized concat instead of row-by-row iteration.
     """
-    base = ["date", "venue", "tempo", "possessions"]
+    base = ["date", "venue", "tempo", "possessions", "conf"]
 
     # Team 1 rows
     t1_src = base + [
@@ -379,8 +385,7 @@ def build_rolling_stats(
     """
     For each team-game, compute rolling & EMA features *prior* to that game.
 
-    This is a key improvement over KenPom: we capture recency-weighted
-    trajectories, not just season-long adjusted averages.
+    Uses strictly pre-game data for opponent quality to avoid lookahead bias.
     """
     if windows is None:
         windows = [5, 10, 20]
@@ -412,16 +417,48 @@ def build_rolling_stats(
             shifted.rolling(window=5, min_periods=3).std()
         )
 
-    # Rolling opponent quality
+    # --- Fix lookahead bias in opponent quality ---
+    # Build a lookup of each team's pre-game quality/ranking from their own
+    # prior games, then join that to the opponent's row at game time.
+    tg["own_qual_pre"] = grouped["qual"].shift(1).ewm(span=ema_span, min_periods=3).mean()
+    tg["own_rk_pre"] = grouped["rk"].shift(1).ewm(span=ema_span, min_periods=3).mean()
+
+    # Create a unique game key for merging opponent's pre-game stats
+    tg["_date_str"] = tg["date"].astype(str)
+    tg["_game_key"] = tg["_date_str"] + "_" + tg["team"]
+
+    # Build opponent lookup: for each (date, team), what is opponent's pre-game quality?
+    opp_lookup = tg[["_date_str", "team", "own_qual_pre", "own_rk_pre"]].copy()
+    opp_lookup = opp_lookup.rename(columns={
+        "team": "_opp_for_lookup",
+        "own_qual_pre": "_opp_qual_pre_game",
+        "own_rk_pre": "_opp_rk_pre_game",
+    })
+
+    tg = tg.merge(
+        opp_lookup,
+        left_on=["_date_str", "opp"],
+        right_on=["_date_str", "_opp_for_lookup"],
+        how="left",
+    )
+
+    # Rolling opponent quality using pre-game opponent stats (no lookahead)
     tg["opp_qual_ema"] = (
-        grouped["opp_qual"].shift(1).ewm(span=ema_span, min_periods=3).mean()
+        tg.groupby("team")["_opp_qual_pre_game"]
+        .transform(lambda x: x.shift(1).ewm(span=ema_span, min_periods=3).mean())
     )
     tg["opp_rk_ema"] = (
-        grouped["opp_rk"].shift(1).ewm(span=ema_span, min_periods=3).mean()
+        tg.groupby("team")["_opp_rk_pre_game"]
+        .transform(lambda x: x.shift(1).ewm(span=ema_span, min_periods=3).mean())
     )
 
     # Games played
     tg["games_played"] = grouped.cumcount()
+
+    # Cleanup temporary columns
+    tg = tg.drop(columns=["_date_str", "_game_key", "_opp_for_lookup",
+                           "_opp_qual_pre_game", "_opp_rk_pre_game",
+                           "own_qual_pre", "own_rk_pre"], errors="ignore")
 
     return tg
 
@@ -453,7 +490,7 @@ def build_upcoming_rows(
         home_team, away_team, total_point, spread_home_point
         (from odds_api.pick_consensus_line)
     rolling : DataFrame from build_rolling_stats
-    name_map : dict mapping Odds API team names → Torvik team names
+    name_map : dict mapping Odds API team names -> Torvik team names
 
     Returns
     -------
@@ -516,8 +553,11 @@ def build_upcoming_rows(
 
 
 # ---------------------------------------------------------------------------
-# Merge Vegas + Torvik → feature matrix
+# Merge Vegas + Torvik -> feature matrix
 # ---------------------------------------------------------------------------
+
+_ET = ZoneInfo("US/Eastern")
+
 
 def merge_datasets(
     vegas: pd.DataFrame,
@@ -528,7 +568,7 @@ def merge_datasets(
     Join Vegas lines with Torvik rolling stats to produce the modelling
     dataset. Each row = one game with home/away features + Vegas line.
     """
-    # Map Vegas names → Torvik names
+    # Map Vegas names -> Torvik names
     vegas = vegas.copy()
     vegas["home_torvik"] = vegas["home_team"].map(name_map)
     vegas["away_torvik"] = vegas["away_team"].map(name_map)
@@ -537,10 +577,11 @@ def merge_datasets(
     vegas = vegas.dropna(subset=["home_torvik", "away_torvik"])
 
     # Convert Vegas UTC dates to US Eastern for matching with Torvik
-    # Torvik uses Eastern dates; Vegas game_datetime_utc is in UTC.
-    # Subtract 5 hours (ET offset) to get the correct calendar date.
+    # Use proper timezone conversion (handles DST correctly)
     vegas_dt = pd.to_datetime(vegas["game_datetime_utc"], utc=True, errors="coerce")
-    vegas["game_date"] = (vegas_dt - pd.Timedelta(hours=5)).dt.tz_localize(None).dt.normalize()
+    vegas["game_date"] = (
+        vegas_dt.dt.tz_convert(_ET).dt.tz_localize(None).dt.normalize()
+    )
     # Fallback for rows where datetime parsing failed
     fallback_mask = vegas["game_date"].isna()
     if fallback_mask.any():
