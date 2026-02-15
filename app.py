@@ -459,11 +459,13 @@ with tab_value:
                 avail = [c for c in table_cols if c in display.columns]
                 show = display[avail].rename(columns=table_cols)
 
-                # Format game time
+                # Format game time (convert UTC → Eastern)
                 if "Game Time" in show.columns:
-                    show["Game Time"] = pd.to_datetime(
-                        show["Game Time"]
-                    ).dt.strftime("%b %d  %I:%M %p")
+                    show["Game Time"] = (
+                        pd.to_datetime(show["Game Time"], utc=True)
+                        .dt.tz_convert("US/Eastern")
+                        .dt.strftime("%b %d  %I:%M %p ET")
+                    )
 
                 fmt = {}
                 if "Vegas Total" in show.columns:
