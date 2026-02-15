@@ -2,12 +2,13 @@
 Feature engineering for the NCAAB totals model.
 
 Key philosophy: overcome KenPom's shortcomings by capturing:
-  1. Non-linear pace × efficiency interactions
+  1. Non-linear pace x efficiency interactions
   2. Recency-weighted trajectories (not just season averages)
   3. Matchup-specific tempo dynamics
   4. Game-context features (venue, conference, mismatch level)
   5. Scoring volatility & consistency
   6. Opponent-quality-adjusted metrics
+  7. Home-court advantage & conference indicators
 """
 
 import numpy as np
@@ -22,6 +23,9 @@ _WINDOWS = [5, 10, 20]
 _EMA = 10
 _STATS = ["adjt", "adjo", "adjd", "pts", "opp_pts", "ppp", "opp_ppp",
           "tempo", "possessions"]
+
+# Major conference identifiers (Torvik conference abbreviations)
+_MAJOR_CONFERENCES = {"B12", "B10", "SEC", "ACC", "BE", "P12", "MWC", "A10", "WCC", "MVC"}
 
 
 def _col(side: str, stat: str, suffix: str) -> str:
@@ -60,7 +64,7 @@ def build_feature_matrix(merged: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]
     # ------------------------------------------------------------------
     # 3. KenPom-style baseline (for comparison / stacking)
     # ------------------------------------------------------------------
-    # Traditional: predicted_total ≈ (AdjO_A + AdjO_B) / 2 adjusted by pace
+    # Traditional: predicted_total ~ (AdjO_A + AdjO_B) / 2 adjusted by pace
     for suffix in [f"ema{_EMA}", "season"]:
         ho = _col("h", "adjo", suffix)
         hd = _col("h", "adjd", suffix)
@@ -199,15 +203,43 @@ def build_feature_matrix(merged: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]
             feat_cols.append(f"{side}_tempo_trend")
 
     # ------------------------------------------------------------------
-    # 9. Conference game indicator
+    # 9. Calendar & venue features
     # ------------------------------------------------------------------
-    # Approximate: games after mid-December in season tend to be conf games
     df["month"] = df["game_date"].dt.month
     game_dates = df["game_date"].dt.tz_localize(None) if df["game_date"].dt.tz else df["game_date"]
     df["day_of_season"] = (
         game_dates - game_dates.dt.to_period("Y").dt.start_time
     ).dt.days
-    feat_cols.extend(["month"])
+    feat_cols.extend(["month", "day_of_season"])
+
+    # ------------------------------------------------------------------
+    # 10. Home-court advantage & conference features
+    # ------------------------------------------------------------------
+    # Venue: 1=home, 0=neutral/away (Torvik uses "H","A","N")
+    for side, vcol in [("h", "h_venue"), ("a", "a_venue")]:
+        if vcol in df.columns:
+            df[f"{side}_is_home"] = (df[vcol].astype(str).str.strip().str.upper() == "H").astype(int)
+            feat_cols.append(f"{side}_is_home")
+
+    # Conference indicators
+    h_conf_col = "h_conf"
+    a_conf_col = "a_conf"
+    if h_conf_col in df.columns and a_conf_col in df.columns:
+        h_conf = df[h_conf_col].astype(str).str.strip().str.upper()
+        a_conf = df[a_conf_col].astype(str).str.strip().str.upper()
+
+        # Conference game indicator
+        df["is_conf_game"] = (h_conf == a_conf).astype(int)
+        feat_cols.append("is_conf_game")
+
+        # Major conference indicator for each team
+        df["h_major_conf"] = h_conf.isin(_MAJOR_CONFERENCES).astype(int)
+        df["a_major_conf"] = a_conf.isin(_MAJOR_CONFERENCES).astype(int)
+        feat_cols.extend(["h_major_conf", "a_major_conf"])
+
+        # Both major conferences (power matchup)
+        df["both_major"] = (df["h_major_conf"] & df["a_major_conf"]).astype(int)
+        feat_cols.append("both_major")
 
     # ------------------------------------------------------------------
     # Cleanup: only keep columns that exist and have data
