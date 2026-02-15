@@ -203,8 +203,9 @@ def build_feature_matrix(merged: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]
     # ------------------------------------------------------------------
     # Approximate: games after mid-December in season tend to be conf games
     df["month"] = df["game_date"].dt.month
+    game_dates = df["game_date"].dt.tz_localize(None) if df["game_date"].dt.tz else df["game_date"]
     df["day_of_season"] = (
-        df["game_date"] - df["game_date"].dt.to_period("Y").dt.start_time
+        game_dates - game_dates.dt.to_period("Y").dt.start_time
     ).dt.days
     feat_cols.extend(["month"])
 
