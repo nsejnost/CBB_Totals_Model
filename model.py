@@ -23,13 +23,13 @@ import warnings
 try:
     import xgboost as xgb
     HAS_XGB = True
-except ImportError:
+except (ImportError, OSError):
     HAS_XGB = False
 
 try:
     import lightgbm as lgb
     HAS_LGB = True
-except ImportError:
+except (ImportError, OSError):
     HAS_LGB = False
 
 
@@ -295,6 +295,48 @@ def walk_forward_backtest(
 # ---------------------------------------------------------------------------
 # Backtest metrics
 # ---------------------------------------------------------------------------
+
+def train_full_model(
+    df: pd.DataFrame,
+    feat_cols: list[str],
+    params: dict | None = None,
+) -> TotalsModel:
+    """
+    Train a TotalsModel on the *entire* historical dataset.
+
+    Use this for making forward-looking predictions on upcoming games
+    (as opposed to walk-forward backtesting which is for evaluation).
+    """
+    params = {**DEFAULT_PARAMS, **(params or {})}
+    target = df["actual_total"] - df["vegas_total"]
+    mask = target.notna()
+    if mask.sum() < 50:
+        raise ValueError("Not enough training data to fit model")
+
+    model = TotalsModel(params)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model.fit(df[mask], target[mask], feat_cols)
+    return model
+
+
+def predict_upcoming(
+    model: TotalsModel,
+    upcoming_features: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Apply a fitted model to upcoming games and compute edges vs Vegas.
+
+    Returns the upcoming_features DataFrame with added columns:
+        model_total, model_edge, bet_side
+    """
+    df = upcoming_features.copy()
+    df["model_total"] = model.predict_total(df)
+    df["model_edge"] = df["model_total"] - df["vegas_total"]
+    df["bet_side"] = np.where(df["model_edge"] > 0, "OVER", "UNDER")
+    df["abs_edge"] = df["model_edge"].abs()
+    return df
+
 
 def compute_backtest_metrics(bt: pd.DataFrame) -> dict:
     """Compute summary metrics from backtest results."""
