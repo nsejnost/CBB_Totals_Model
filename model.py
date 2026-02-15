@@ -23,13 +23,13 @@ import warnings
 try:
     import xgboost as xgb
     HAS_XGB = True
-except ImportError:
+except (ImportError, OSError):
     HAS_XGB = False
 
 try:
     import lightgbm as lgb
     HAS_LGB = True
-except ImportError:
+except (ImportError, OSError):
     HAS_LGB = False
 
 
