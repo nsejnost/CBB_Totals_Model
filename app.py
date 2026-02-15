@@ -242,12 +242,19 @@ if "backtest_results" not in st.session_state:
     st.session_state.backtest_metrics = None
 
 if run_backtest:
-    with st.spinner("Running walk-forward backtest… this may take a minute."):
-        bt = walk_forward_backtest(feature_df, feat_cols, user_params)
-        metrics = compute_backtest_metrics(bt)
-        st.session_state.backtest_results = bt
-        st.session_state.backtest_params = user_params.copy()
-        st.session_state.backtest_metrics = metrics
+    progress_bar = st.progress(0, text="Running walk-forward backtest…")
+    bt = walk_forward_backtest(
+        feature_df, feat_cols, user_params,
+        progress_callback=lambda pct: progress_bar.progress(
+            min(pct, 1.0),
+            text=f"Backtesting… {pct:.0%} complete",
+        ),
+    )
+    progress_bar.progress(1.0, text="Backtest complete!")
+    metrics = compute_backtest_metrics(bt)
+    st.session_state.backtest_results = bt
+    st.session_state.backtest_params = user_params.copy()
+    st.session_state.backtest_metrics = metrics
 
 bt = st.session_state.backtest_results
 metrics = st.session_state.backtest_metrics
